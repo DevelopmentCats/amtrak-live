@@ -13,7 +13,7 @@ let tickT = null;
 let es = null;           // EventSource
 let lastPush = 0;        // ts of last data (push or poll)
 let lastMode = "";       // push | poll
-let map = null, marker = null, halo = null, track = null;
+let map = null, marker = null, halo = null, track = null, stopsL = null;
 let gps = null;         // last GPS fix {lat, lon, at, hdg} for dead reckoning
 
 /* great-circle helpers: keep the dot gliding between GPS fixes */
@@ -201,6 +201,26 @@ function drawMap(t, stops, idx) {
     if (track) track.setLatLngs(pts);
     else track = L.polyline(pts, { color: "#6cbcff", weight: 3, opacity: 0.55 }).addTo(map);
   }
+
+  // stops on the route: dim = done, big green + label = next, blue = ahead
+  if (stopsL) { map.removeLayer(stopsL); stopsL = null; }
+  stopsL = L.layerGroup().addTo(map);
+  stops.forEach((s, i) => {
+    const q = (s.lat && s.lon) ? [s.lat, s.lon]
+      : (stationsMeta && stationsMeta[s.code]) ? [stationsMeta[s.code].lat, stationsMeta[s.code].lon] : null;
+    if (!q) return;
+    const isNext = i === idx + 1, past = i <= idx;
+    const m = L.circleMarker(q, {
+      radius: isNext ? 7 : past ? 3 : 4.5,
+      color: isNext ? "#43d17c" : past ? "#5b6b7c" : "#6cbcff",
+      weight: isNext ? 3 : 1.5,
+      fillColor: isNext ? "#43d17c" : "#0b0f14",
+      fillOpacity: past ? 0.3 : 0.9,
+    });
+    if (isNext) m.bindTooltip(`next: ${s.name}`, { permanent: true, direction: "top", className: "nextTip" });
+    else m.bindTooltip(`${s.name}${s.bus ? " (bus)" : ""} — arr ${fmtT(s.effArr)}`, { direction: "top" });
+    stopsL.addLayer(m);
+  });
   map.panTo(ll, { animate: true, duration: 0.6 });
 }
 
