@@ -277,6 +277,10 @@ function listen(num) {
       } catch {}
     };
     es.onerror = () => conn(false); // EventSource auto-reconnects
+    es.addEventListener("gone", () => { // server says this train is done
+      getJSON(`/api/train/${num}`).then(d => { if (applyPayload(d)) conn(); })
+        .catch(() => { $("#pickHint").textContent = "that train has ended"; showPicker(); });
+    });
   }
 }
 function closeStream() { if (es) { es.close(); es = null; } }
@@ -302,7 +306,12 @@ function refresh() {
   return getJSON(`/api/train/${cur.numKey}`).then(d => {
     lastPush = Date.now(); lastMode = "poll";
     applyPayload(d); conn();
-  }).catch(() => conn(false, "poll failed"));
+  }).catch(e => {
+    if (String(e.message || "").includes("404") && cur) { // train no longer running
+      $("#pickHint").textContent = "that train has ended — pick another";
+      showPicker();
+    } else conn(false, "poll failed");
+  });
 }
 
 function conn(ok = true, msg) {
@@ -350,8 +359,9 @@ function tick() {
     const ageS = (Date.now() - gps.at) / 1000;
     if (v > 1 && ageS > 0 && ageS < 600) {
       let p = null;
-      const nxt = stops[idx + 1];
-      const tr = nxt ? traceData[stops[idx].code + "|" + nxt.code] : null;
+      const prevS = idx >= 0 ? stops[idx] : null;
+      const nxt = idx >= 0 ? stops[idx + 1] : null;
+      const tr = prevS && nxt ? traceData[prevS.code + "|" + nxt.code] : null;
       if (tr && tr.length > 1) {
         const kmY = 110.57, kmX = 111.32 * Math.cos(gps.lat * D2R);
         const P = tr.map(q => [q[1] * kmX, q[0] * kmY]);
@@ -427,7 +437,10 @@ function trackTrain(num, preferID) {
     listen(key);        // live push from here on
     startLoops();       // 1 s tick: countdown + watchdog
     loadTrace(key);     // real track geometry for legs already run
-  }).catch(e => { $("#pickHint").textContent = `#${num}: ${e.message}`; });
+  }).catch(e => {
+    $("#pickHint").textContent = `#${num}: ${e.message}`;
+    if ($("#picker").hidden) { closeStream(); stopLoops(); $("#picker").hidden = false; }
+  });
 }
 
 function remember(t) {
