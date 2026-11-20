@@ -152,7 +152,9 @@ function drawMap(t, stops, idx) {
     if (typeof L === "undefined") return;
     map = L.map("map", { zoomControl: false, attributionControl: true, dragging: true });
     L.control.zoom({ position: "bottomright" }).addTo(map);
-    L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
+    const key = (typeof window !== "undefined" && window.CARTO_KEY) || "";
+    const tileUrl = `https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png${key ? `?key=${encodeURIComponent(key)}` : ""}`;
+    L.tileLayer(tileUrl, {
       attribution: "© OSM © CARTO", maxZoom: 18, subdomains: "abcd",
     }).addTo(map);
   }
