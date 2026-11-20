@@ -182,10 +182,6 @@ function drawMap(t, stops, idx) {
     L.tileLayer(tileUrl, {
       attribution: "© OSM © CARTO", maxZoom: 18, subdomains: "abcd",
     }).addTo(map);
-    // real rail geometry: the station-to-station line is straight, tracks curve
-    L.tileLayer("https://{s}.tiles.openrailwaymap.org/standard/{z}/{x}/{y}.png", {
-      attribution: "rails © OpenRailwayMap CC-BY-SA", maxZoom: 19, subdomains: "ab", opacity: 0.85,
-    }).addTo(map);
   }
   const ll = [t.lat, t.lon];
   if (!marker) {
@@ -198,8 +194,8 @@ function drawMap(t, stops, idx) {
   const pts = stops.map(s => (s.lat && s.lon) || (stationsMeta && stationsMeta[s.code])
     ? (s.lat ? [s.lat, s.lon] : [stationsMeta[s.code].lat, stationsMeta[s.code].lon]) : null).filter(Boolean);
   if (pts.length > 1) {
-    if (track) track.setLatLngs(pts);
-    else track = L.polyline(pts, { color: "#6cbcff", weight: 3, opacity: 0.55 }).addTo(map);
+    if (track) { track.setStyle({ weight: 4, opacity: 0.8 }); track.setLatLngs(pts); }
+    else track = L.polyline(pts, { color: "#6cbcff", weight: 4, opacity: 0.8 }).addTo(map);
   }
 
   // stops on the route: dim = done, big green + label = next, blue = ahead
@@ -210,14 +206,16 @@ function drawMap(t, stops, idx) {
       : (stationsMeta && stationsMeta[s.code]) ? [stationsMeta[s.code].lat, stationsMeta[s.code].lon] : null;
     if (!q) return;
     const isNext = i === idx + 1, past = i <= idx;
+    const isEnd = i === 0 || i === stops.length - 1;
     const m = L.circleMarker(q, {
-      radius: isNext ? 7 : past ? 3 : 4.5,
-      color: isNext ? "#43d17c" : past ? "#5b6b7c" : "#6cbcff",
-      weight: isNext ? 3 : 1.5,
-      fillColor: isNext ? "#43d17c" : "#0b0f14",
-      fillOpacity: past ? 0.3 : 0.9,
+      radius: isNext ? 7 : isEnd ? 6 : past ? 3 : 4.5,
+      color: isNext ? "#43d17c" : isEnd ? "#eef4fa" : past ? "#5b6b7c" : "#6cbcff",
+      weight: isNext || isEnd ? 3 : 1.5,
+      fillColor: isNext || isEnd ? (isNext ? "#43d17c" : "#0b0f14") : "#0b0f14",
+      fillOpacity: past && !isEnd ? 0.3 : 0.9,
     });
     if (isNext) m.bindTooltip(`next: ${s.name}`, { permanent: true, direction: "top", className: "nextTip" });
+    else if (isEnd) m.bindTooltip(`${i === 0 ? "start" : "dest"}: ${s.name}`, { permanent: true, direction: "top", className: "endTip" });
     else m.bindTooltip(`${s.name}${s.bus ? " (bus)" : ""} — arr ${fmtT(s.effArr)}`, { direction: "top" });
     stopsL.addLayer(m);
   });

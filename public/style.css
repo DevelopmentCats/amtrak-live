@@ -97,6 +97,9 @@ input{background:rgba(0,0,0,.45);border:1px solid var(--line);color:var(--txt);b
 .nextTip{background:rgba(9,14,19,.92);border:1px solid #2c5c3f;color:#7ee787;font-weight:700;font-size:12px;
   padding:2px 8px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.5)}
 .nextTip:before{border-top-color:#2c5c3f}
+.endTip{background:rgba(9,14,19,.92);border:1px solid #3a4a5c;color:#cfe0f0;font-weight:600;font-size:12px;
+  padding:2px 8px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.5)}
+.endTip:before{border-top-color:#3a4a5c}
 .pulse{border-radius:50%;background:rgba(67,209,124,.35);box-shadow:0 0 0 0 rgba(67,209,124,.5);animation:pulse 2.2s infinite}
 @keyframes pulse{70%{box-shadow:0 0 0 18px rgba(67,209,124,0)}100%{box-shadow:0 0 0 0 rgba(67,209,124,0)}}
 
