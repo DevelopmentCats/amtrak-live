@@ -14,6 +14,31 @@ let es = null;           // EventSource
 let lastPush = 0;        // ts of last data (push or poll)
 let lastMode = "";       // push | poll
 let map = null, marker = null, halo = null, track = null;
+let gps = null;         // last GPS fix {lat, lon, at, hdg} for dead reckoning
+
+/* great-circle helpers: keep the dot gliding between GPS fixes */
+const D2R = Math.PI / 180, R2D = 180 / Math.PI;
+function bearing(la1, lo1, la2, lo2) {
+  const dLon = (lo2 - lo1) * D2R;
+  const y = Math.sin(dLon) * Math.cos(la2 * D2R);
+  const x = Math.cos(la1 * D2R) * Math.sin(la2 * D2R) -
+    Math.sin(la1 * D2R) * Math.cos(la2 * D2R) * Math.cos(dLon);
+  return (Math.atan2(y, x) * R2D + 360) % 360;
+}
+function dest(la, lo, brng, km) {
+  const d = km / 6371, b = brng * D2R, la1 = la * D2R, lo1 = lo * D2R;
+  const la2 = Math.asin(Math.sin(la1) * Math.cos(d) + Math.cos(la1) * Math.sin(d) * Math.cos(b));
+  const lo2 = lo1 + Math.atan2(Math.sin(b) * Math.sin(d) * Math.cos(la1),
+    Math.cos(d) - Math.sin(la1) * Math.sin(la2));
+  return [la2 * R2D, ((lo2 * R2D) + 540) % 360 - 180];
+}
+function updateGps(t) {
+  if (!t.lat || !t.lon) return;
+  const lat = +t.lat, lon = +t.lon;
+  if (gps && gps.lat === lat && gps.lon === lon) { gps.at = Date.now(); return; }
+  const hdg = gps ? bearing(gps.lat, gps.lon, lat, lon) : null;
+  gps = { lat, lon, at: Date.now(), hdg: hdg ?? gps?.hdg ?? null };
+}
 
 /* ---------------- data ---------------- */
 async function getJSON(url) {
@@ -157,6 +182,10 @@ function drawMap(t, stops, idx) {
     L.tileLayer(tileUrl, {
       attribution: "© OSM © CARTO", maxZoom: 18, subdomains: "abcd",
     }).addTo(map);
+    // real rail geometry: the station-to-station line is straight, tracks curve
+    L.tileLayer("https://{s}.tiles.openrailwaymap.org/standard/{z}/{x}/{y}.png", {
+      attribution: "rails © OpenRailwayMap CC-BY-SA", maxZoom: 19, subdomains: "ab", opacity: 0.85,
+    }).addTo(map);
   }
   const ll = [t.lat, t.lon];
   if (!marker) {
@@ -196,6 +225,7 @@ function applyPayload(d) {
   if (!t) return false;
   const changed = JSON.stringify(t) !== JSON.stringify(cur?.train || null);
   cur = { numKey: key, train: t };
+  updateGps(t);
   if (changed) render();
   return true;
 }
@@ -262,6 +292,15 @@ function tick() {
     if (!es || es.readyState === 2) listen(cur.numKey); // 2 CLOSED
   } else if (lastPush && age > 20000) {
     conn();
+  }
+  // dead-reckon: glide the dot along the last heading at reported speed
+  if (marker && gps && cur?.train) {
+    const v = +cur.train.velocity || 0;
+    const ageS = (Date.now() - gps.at) / 1000;
+    if (v > 1 && gps.hdg != null && ageS > 0 && ageS < 90) {
+      const p = dest(gps.lat, gps.lon, gps.hdg, (v * 1.60934 * ageS) / 3600);
+      marker.setLatLng(p); halo.setLatLng(p);
+    }
   }
 }
 
