@@ -9,7 +9,10 @@ const TICK_MS = 1000;    // local clock/countdown
 let trainsList = null;   // full list for the picker (lazy)
 let stationsMeta = null;
 let cur = null;          // { numKey, train }  active train
-let pollT = null, tickT = null;
+let tickT = null;
+let es = null;           // EventSource
+let lastPush = 0;        // ts of last data (push or poll)
+let lastMode = "";       // push | poll
 let map = null, marker = null, halo = null, track = null;
 
 /* ---------------- data ---------------- */
@@ -30,7 +33,7 @@ async function loadStations() {
 
 async function loadPickerList() {
   if (trainsList) return trainsList;
-  trainsList = await getJSON("/api/trains");
+  trainsList = await getJSON("/api/list"); // tiny index, fast on train wifi
   return trainsList;
 }
 
@@ -183,53 +186,99 @@ function tickClock() {
   $("#nextIn").textContent = sec < 45 ? "arriving" : `in ${fmtIn(Math.floor(sec / 60))}`;
 }
 
-/* ---------------- data loop ---------------- */
-async function refresh() {
+/* ---------------- live data: SSE push, poll fallback ---------------- */
+function applyPayload(d) {
+  const key = Object.keys(d || {})[0];
+  if (!key) return false;
+  const t = pickInstance(d[key]);
+  if (!t) return false;
+  const changed = JSON.stringify(t) !== JSON.stringify(cur?.train || null);
+  cur = { numKey: key, train: t };
+  if (changed) render();
+  return true;
+}
+
+function listen(num) {
+  closeStream();
   try {
-    if (cur) {
-      const d = await getJSON(`/api/train/${cur.numKey}`);
-      const key = Object.keys(d)[0];
-      const t = pickInstance(d[key]);
-      if (t) cur = { numKey: key, train: t };
-      render();
-    } else if (trainsList) {
-      renderPicker(); // keep picker fresh
-    }
-    conn(true);
-  } catch (e) { conn(false, e.message); }
+    es = new EventSource(`/api/stream/train/${num}`);
+  } catch { es = null; }
+  if (es) {
+    es.onmessage = ev => {
+      try {
+        const d = JSON.parse(ev.data);
+        lastPush = Date.now(); lastMode = "push";
+        if (applyPayload(d)) conn();
+      } catch {}
+    };
+    es.onerror = () => conn(false); // EventSource auto-reconnects
+  }
 }
-function conn(ok, msg) {
+function closeStream() { if (es) { es.close(); es = null; } }
+
+function refresh() {
+  if (!cur) return Promise.resolve();
+  return getJSON(`/api/train/${cur.numKey}`).then(d => {
+    lastPush = Date.now(); lastMode = "poll";
+    applyPayload(d); conn();
+  }).catch(() => conn(false, "poll failed"));
+}
+
+function conn(ok = true, msg) {
   const el = $("#conn");
-  el.className = "conn small " + (ok ? "ok" : "err");
-  el.textContent = ok ? `live ${new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" })}` : (msg || "error");
+  if (!ok) { el.className = "conn small err"; el.textContent = msg || "reconnecting…"; return; }
+  if (!lastPush) { el.className = "conn small"; el.textContent = "…"; return; }
+  const age = Date.now() - lastPush;
+  const t = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" });
+  if (age < 25000) { el.className = "conn small ok"; el.style.color = ""; el.textContent = `live · ${lastMode} ${t}`; }
+  else if (age < 60000) { el.className = "conn small"; el.style.color = "var(--amber)"; el.textContent = `syncing… ${t}`; }
+  else { el.className = "conn small err"; el.style.color = ""; el.textContent = `stale ${Math.round(age / 1000)}s`; }
 }
-function startLoops() {
-  stopLoops();
-  pollT = setInterval(refresh, POLL_MS);
-  tickT = setInterval(tickClock, TICK_MS);
+
+function startLoops() { stopLoops(); tickT = setInterval(tick, 1000); }
+function stopLoops() { clearInterval(tickT); tickT = null; }
+
+/* per-second: clock + countdown + staleness watchdog */
+function tick() {
+  const d = new Date();
+  $("#clock").textContent = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  if (!cur?.train) return;
+
+  const stops = (cur.train.stations || []).map(norm);
+  const idx = activeIdx(stops);
+  const next = stops[idx + 1];
+  if (!next || !next.effArr) { $("#nextIn").textContent = ""; }
+  else {
+    const sec = Math.max(0, Math.round((new Date(next.effArr) - Date.now()) / 1000));
+    $("#nextIn").textContent = sec < 45 ? "arriving" : `in ${fmtIn(Math.floor(sec / 60))}`;
+  }
+
+  // never fall behind: stale? poll now. stream dead? reopen it.
+  const age = Date.now() - lastPush;
+  if (lastPush && age > 40000) {
+    refresh();
+    if (!es || es.readyState === 2) listen(cur.numKey); // 2 CLOSED
+  } else if (lastPush && age > 20000) {
+    conn();
+  }
 }
-function stopLoops() { clearInterval(pollT); clearInterval(tickT); pollT = tickT = null; }
-document.addEventListener("visibilitychange", () => {
-  if (document.hidden) stopLoops();
-  else { refresh(); startLoops(); }
-});
+
+// instant catch-up when the tab comes back or network returns
+document.addEventListener("visibilitychange", () => { if (!document.hidden && cur) refresh(); });
+addEventListener("online", () => { if (cur) { refresh(); if (!es || es.readyState === 2) listen(cur.numKey); } });
 
 /* ---------------- picker ---------------- */
 function renderPicker() {
   if (!trainsList) return;
-  const rows = [];
-  for (const inst of Object.values(trainsList)) {
-    for (const t of inst) {
-      const st = (t.stations || []).map(norm);
-      const i = activeIdx(st);
-      const late = st[i + 1] ? st[i + 1].late : null;
-      rows.push(`<div class="trow" data-id="${esc(t.trainID)}" data-num="${esc(t.trainNum)}">
-        <span class="tnum">#${esc(t.trainNum)}</span>
-        <span class="troute">${esc(t.routeName || "")}<br><span class="dim">to ${esc(t.destName || "")}</span></span>
-        <span class="badge ${late != null && late > 15 ? "b-late" : "b-ok"}">${late == null ? "" : late > 15 ? late + "m late" : "on time"}</span>
-      </div>`);
-    }
-  }
+  // /api/list rows: { n:num, id, r:route, d:dest, late }
+  const rows = trainsList.map(t => {
+    const late = t.late;
+    return `<div class="trow" data-id="${esc(t.id)}" data-num="${t.n}">
+      <span class="tnum">#${t.n}</span>
+      <span class="troute">${esc(t.r || "")}<br><span class="dim">to ${esc(t.d || "")}</span></span>
+      <span class="badge ${late != null && late > 15 ? "b-late" : "b-ok"}">${late == null ? "" : late > 15 ? late + "m late" : "on time"}</span>
+    </div>`;
+  });
   rows.sort((a, b) => (a.match(/#(\d+)/)?.[1] ?? 0) - (b.match(/#(\d+)/)?.[1] ?? 0));
   $("#trainList").innerHTML = rows.join("") || `<div class="dim">no trains found</div>`;
   $("#trainList").querySelectorAll(".trow").forEach(el =>
@@ -248,8 +297,10 @@ function trackTrain(num, preferID) {
     location.hash = `t=${t.trainID}`;
     remember(t);
     $("#picker").hidden = true;
+    lastPush = Date.now(); lastMode = "poll";
     render();
-    if (!pollT) startLoops(); else refresh();
+    listen(key);        // live push from here on
+    startLoops();       // 1 s tick: countdown + watchdog
   }).catch(e => { $("#pickHint").textContent = `#${num}: ${e.message}`; });
 }
 
@@ -270,6 +321,7 @@ function renderRecent() {
 }
 
 function showPicker() {
+  closeStream();
   stopLoops();
   $("#picker").hidden = false;
   loadPickerList().then(renderPicker).catch(e => { $("#pickHint").textContent = e.message; });
@@ -298,8 +350,8 @@ function showPicker() {
   const m = location.hash.match(/t=([\w-]+)/);
   const num = m ? +m[1].split("-")[0] : null;
   if (num) {
-    try { await loadStations(); } catch {}
-    trackTrain(num, m[1]); // deep link: straight into the HUD
+    trackTrain(num, m[1]); // deep link: straight into the HUD, no waiting
+    loadStations().catch(() => {}); // polyline only; fills in later
   } else {
     showPicker();
   }

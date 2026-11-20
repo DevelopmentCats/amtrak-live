@@ -93,7 +93,7 @@ async function refreshUpstream() {
     return; // keep serving stale from cache; subscribers just don't get pushes
   }
   const now = Date.now();
-  cache.set("trains", { at: now, goodAt: now, body });
+    cache.set("trains", { at: now, goodAt: now, body });
   if (subs.size === 0) return;
   const hash = crypto.createHash("sha1").update(JSON.stringify(body)).digest("hex");
   if (hash === lastHash) return;
