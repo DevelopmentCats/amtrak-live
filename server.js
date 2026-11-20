@@ -231,15 +231,21 @@ const server = http.createServer(async (req, res) => {
   }
   if (existsSync(file) && statSync(file).isFile()) {
     const type = MIME[extname(file).toLowerCase()] || "application/octet-stream";
+    let body = readFileSync(file);
+    if (type.startsWith("text/html")) {
+      // app-level config: CARTO_API_KEY env var baked into the page at serve time
+      body = Buffer.from(body.toString("utf8").replaceAll("__CARTO_KEY__", process.env.CARTO_API_KEY || ""));
+    }
     res.writeHead(200, { "Content-Type": type, "Cache-Control": "no-cache" });
-    res.end(readFileSync(file));
+    res.end(body);
     return;
   }
   // SPA fallback
   const index = join(__dirname, "public", "index.html");
   if (existsSync(index)) {
+    const body = Buffer.from(readFileSync(index, "utf8").replaceAll("__CARTO_KEY__", process.env.CARTO_API_KEY || ""));
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(readFileSync(index));
+    res.end(body);
     return;
   }
   res.writeHead(404);
