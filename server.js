@@ -1,8 +1,10 @@
 // Amtrak Live — tiny proxy + static server.
-// No dependencies: node:http, node:https, node:fs only.
+// No dependencies: node builtins only. gzip + ETag + per-train endpoint.
 
 import http from "node:http";
 import https from "node:https";
+import zlib from "node:zlib";
+import crypto from "node:crypto";
 import { readFileSync, existsSync, statSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,10 +17,10 @@ const UPSTREAMS = {
   trains: "https://api.amtraker.com/v3/trains",
   stations: "https://api.amtraker.com/v3/stations",
 };
-const CACHE_TTL_MS = 20 * 1000; // upstream poll cadence
-const STALE_MAX_MS = 10 * 60 * 1000; // serve stale up to 10 min if upstream fails
+const CACHE_TTL_MS = 15 * 1000;
+const STALE_MAX_MS = 10 * 60 * 1000;
 
-/** Simple TTL cache: { at, body } */
+/** { at, goodAt, body } */
 const cache = new Map();
 
 function fetchJSON(url) {
@@ -44,9 +46,7 @@ function fetchJSON(url) {
       }
     );
     req.on("error", reject);
-    req.setTimeout(12000, () => {
-      req.destroy(new Error("upstream timeout"));
-    });
+    req.setTimeout(12000, () => req.destroy(new Error("upstream timeout")));
   });
 }
 
@@ -56,7 +56,7 @@ async function cachedJSON(key) {
   if (entry && now - entry.at < CACHE_TTL_MS) return entry.body;
   try {
     const body = await fetchJSON(UPSTREAMS[key]);
-    cache.set(key, { at: now, body, goodAt: now });
+    cache.set(key, { at: now, goodAt: now, body });
     return body;
   } catch (err) {
     if (entry && now - entry.goodAt < STALE_MAX_MS) return entry.body;
@@ -75,26 +75,74 @@ const MIME = {
   ".woff2": "font/woff2",
 };
 
+/** gzip + ETag + 304 support for a JSON object */
+function sendJSON(req, res, obj, sMaxAge = 10) {
+  const raw = Buffer.from(JSON.stringify(obj));
+  const etag = `"${crypto.createHash("sha1").update(raw).digest("hex").slice(0, 16)}"`;
+  const headers = { "Content-Type": "application/json", "Cache-Control": `public, max-age=${sMaxAge}`, ETag: etag };
+  if (req.headers["if-none-match"] === etag) {
+    res.writeHead(304, headers);
+    res.end();
+    return;
+  }
+  if ((req.headers["accept-encoding"] || "").includes("gzip")) {
+    zlib.gzip(raw, { level: 6 }, (err, buf) => {
+      if (err) {
+        res.writeHead(200, headers);
+        res.end(raw);
+        return;
+      }
+      res.writeHead(200, { ...headers, "Content-Encoding": "gzip", "Content-Length": buf.length });
+      res.end(buf);
+    });
+  } else {
+    res.writeHead(200, { ...headers, "Content-Length": raw.length });
+    res.end(raw);
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
+  const p = url.pathname;
 
-  if (url.pathname === "/api/trains" || url.pathname === "/api/stations") {
-    const key = url.pathname.slice(5);
-    try {
-      const body = await cachedJSON(key);
-      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "public, max-age=10" });
-      res.end(JSON.stringify(body));
-    } catch (err) {
-      res.writeHead(502, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: String(err.message || err) }));
+  try {
+    if (p === "/api/trains" || p === "/api/stations") {
+      sendJSON(req, res, await cachedJSON(p.slice(5)), p === "/api/stations" ? 3600 : 10);
+      return;
     }
+
+    // /api/train/<number> -> just that train's instances (~KBs instead of 1.3 MB)
+    const m = p.match(/^\/api\/train\/(\d+)$/);
+    if (m) {
+      const all = await cachedJSON("trains");
+      const key = Object.keys(all).find(k => k === m[1] || k.split("-")[0] === m[1]);
+      if (!key) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "train not running" }));
+        return;
+      }
+      // slim the payload: drop fields the HUD never reads
+      const slim = { [key]: all[key].map(t => {
+        const { alerts, dataSource, provider, providerShort, onlyOfTrainNum, trainNumRaw, iconColor, textColor, stopIconColor, ...rest } = t;
+        rest.stations = t.stations.map(s => {
+          const { stopIconColor, ...rs } = s;
+          return rs;
+        });
+        return rest;
+      }) };
+      sendJSON(req, res, slim, 10);
+      return;
+    }
+  } catch (err) {
+    res.writeHead(502, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: String(err.message || err) }));
     return;
   }
 
   // static files from public/
-  let p = normalize(url.pathname).replace(/^(\.\.[/\\])+/, "");
-  if (p === "/" || p === "\\") p = "/index.html";
-  const file = join(__dirname, "public", p);
+  let fp = normalize(p).replace(/^(\.[/\\])+/, "");
+  if (fp === "/" || fp === "\\") fp = "/index.html";
+  const file = join(__dirname, "public", fp);
   if (!file.startsWith(join(__dirname, "public"))) {
     res.writeHead(404);
     res.end("not found");
