@@ -122,7 +122,7 @@ function render() {
     : `<div class="dim small">no ${SMOKE_MIN}+ min stops ahead — sit tight.</div>`;
 
   // stats
-  $("#sSpeed").textContent = t.velocity ?? "–";
+  $("#sSpeed").textContent = t.velocity == null || isNaN(+t.velocity) ? "–" : `${Math.round(+t.velocity)}`;
   $("#sDelay").textContent = lat == null ? "–" : `${lat > 0 ? "+" : ""}${lat}m`;
   $("#sPos").textContent = t.lat ? `${t.lat.toFixed(3)}, ${t.lon.toFixed(3)}` : "";
   $("#gmaps").href = t.lat ? `https://www.google.com/maps/@?api=1&map_action=map&center=${t.lat},${t.lon}&zoom=14` : "#";
