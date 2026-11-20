@@ -78,11 +78,24 @@ function norm(s) {
     late: s.arr && s.schArr ? mins(new Date(s.arr) - new Date(s.schArr)) : null,
   };
 }
-function activeIdx(stops) {
-  let i = -1;
-  stops.forEach((s, k) => { if (/^departed$/i.test(s.status || "")) i = k; });
-  if (i < 0) stops.forEach((s, k) => { if (/^arrived$/i.test(s.status || "")) i = k; });
-  return i;
+/* where the train is: done = last completed stop, at = stop being served now.
+   status strings alone are unreliable - confirm with actual arr/dep times. */
+function locate(stops) {
+  const now = Date.now();
+  let done = -1, at = -1;
+  stops.forEach((s, i) => {
+    const dep = s.dep ? new Date(s.dep) : null;
+    const arr = s.arr ? new Date(s.arr) : null;
+    const st = s.status || "";
+    if (/^departed$/i.test(st) || (dep && dep < now)) done = i;
+    else if (/^(station|arrived)$/i.test(st) || (arr && arr <= now && (!dep || dep >= now))) at = i;
+  });
+  return { done, at };
+}
+function nextEvent(stops, loc) { // what the countdown should target
+  if (loc.at >= 0 && stops[loc.at].effDep) return { t: new Date(stops[loc.at].effDep), dep: true };
+  const n = loc.at >= 0 ? stops[loc.at + 1] : stops[loc.done + 1];
+  return n && n.effArr ? { t: new Date(n.effArr), dep: false } : null;
 }
 function fmtIn(m) {
   if (m < 0) return "now";
@@ -109,9 +122,11 @@ function render() {
   if (!cur?.train) return;
   const t = cur.train;
   const stops = (t.stations || []).map(norm);
-  const idx = activeIdx(stops);
-  const next = stops[idx + 1] || null;
-  const prev = stops[idx] || null;
+  const loc = locate(stops);
+  const curStop = loc.at >= 0 ? stops[loc.at] : null;
+  const nIdx = loc.at >= 0 ? loc.at : loc.done + 1; // row to highlight
+  const next = loc.at >= 0 ? (stops[loc.at + 1] || null) : (stops[loc.done + 1] || null);
+  const prev = stops[loc.done] || null;
 
   $("#hudNum").textContent = `#${t.trainNum}`;
   $("#hudRoute").textContent = t.routeName || "";
@@ -130,23 +145,32 @@ function render() {
   if (next) {
     $("#nextName").textContent = next.name;
     $("#nextArr").textContent = `arr ${fmtT(next.effArr)}`;
-    $("#nextSched").textContent = `sched ${fmtT(next.schArr)} · dep ${fmtT(next.effDep)}` +
+    $("#nextSched").textContent = (curStop && curStop.effDep
+      ? `now at ${curStop.name} · dep ${fmtT(curStop.effDep)} — ` : "") +
+      `sched ${fmtT(next.schArr)} · dep ${fmtT(next.effDep)}` +
       (next.late != null ? ` · (${next.late > 0 ? "+" : ""}${next.late}m)` : "");
   } else {
-    $("#nextName").textContent = idx < 0 ? "not started" : "run complete";
+    $("#nextName").textContent = loc.done < 0 && loc.at < 0 ? "not started" : "run complete";
     $("#nextArr").textContent = ""; $("#nextSched").textContent = ""; $("#nextIn").textContent = "";
   }
 
-  // smoke stops
-  const up = stops.slice(idx + 1).filter(s => s.dwell != null && !s.bus);
-  const smoke = up.filter(s => s.dwell >= SMOKE_MIN).slice(0, 3);
+  // smoke stops - a long dwell at the CURRENT stop counts too
+  const smoke = [];
+  if (curStop && !curStop.bus && curStop.effDep) {
+    const left = mins(new Date(curStop.effDep) - Date.now());
+    if (left >= 3) smoke.push({ s: curStop, gap: `${left}′ left`, when: "now" });
+  }
+  for (const s of stops.slice((loc.at >= 0 ? loc.at : loc.done) + 1)) {
+    if (s.dwell == null || s.bus || s.dwell < SMOKE_MIN) continue;
+    const until = mins(new Date(s.effArr) - Date.now());
+    smoke.push({ s, gap: `${s.dwell}′`, when: until > 0 ? "in " + fmtIn(until) : "soon" });
+    if (smoke.length >= 3) break;
+  }
   $("#smokeList").innerHTML = smoke.length
-    ? smoke.map(s => {
-        const until = mins(new Date(s.effArr) - Date.now());
-        return `<div class="stopitem"><span><span class="who">${esc(s.name)}</span>
-          <span class="when"> ${until > 0 ? "in " + fmtIn(until) : "now"}</span></span>
-          <span class="gap">${s.dwell}′</span></div>`;
-      }).join("")
+    ? smoke.map(c => `<div class="stopitem"><span><span class="who">${c.s === curStop ? "here · " : ""}${esc(c.s.name)}</span>
+          <span class="when"> ${c.when}</span></span>
+          <span class="gap">${c.gap}</span></div>`)
+      .join("")
     : `<div class="dim small">no ${SMOKE_MIN}+ min stops ahead — sit tight.</div>`;
 
   // stats
@@ -158,7 +182,7 @@ function render() {
 
   // side drawer rows
   $("#sideRows").innerHTML = stops.map((s, i) => `
-    <div class="row ${i <= idx ? "past" : ""} ${i === idx + 1 ? "next" : ""}">
+    <div class="row ${i <= loc.done ? "past" : ""} ${i === nIdx ? "next" : ""}">
       <span class="dim">${i + 1}</span>
       <span class="stname ${s.bus ? "busT" : ""}">${esc(s.name)}</span>
       <span class="mono">${fmtT(s.effArr)}</span>
@@ -166,7 +190,7 @@ function render() {
       <span class="gapv">${s.dwell != null && s.dwell >= SMOKE_MIN ? s.dwell + "′" : ""}</span>
     </div>`).join("");
 
-  drawMap(t, stops, idx);
+  drawMap(t, stops, loc);
   tickClock(); // eta now
 }
 
@@ -174,7 +198,7 @@ const dcls = m => m == null ? "dim" : m > 4 ? "delta-late" : m < -4 ? "delta-ear
 const dlate = m => m == null ? "–" : `${m > 0 ? "+" : ""}${m}m`;
 
 /* map: dark tiles, train marker + halo, route polyline, follow-cam */
-function drawMap(t, stops, idx) {
+function drawMap(t, stops, loc) {
   if (!t.lat || !t.lon) return;
   if (!map) {
     if (typeof L === "undefined") return;
@@ -200,8 +224,8 @@ function drawMap(t, stops, idx) {
   for (let i = 0; i < stops.length - 1; i++) {
     const A = ptOf(stops[i]), B = ptOf(stops[i + 1]);
     if (!A || !B) continue;
-    const tr = i <= idx ? traceData[stops[i].code + "|" + stops[i + 1].code] : null;
-    (i <= idx ? past : fut).push(...(tr && tr.length > 1 ? tr : [A, B]));
+    const tr = i <= loc.done ? traceData[stops[i].code + "|" + stops[i + 1].code] : null;
+    (i <= loc.done ? past : fut).push(...(tr && tr.length > 1 ? tr : [A, B]));
   }
   if (past.length > 1) {
     if (trackPast) trackPast.setLatLngs(past);
@@ -219,7 +243,7 @@ function drawMap(t, stops, idx) {
     const q = (s.lat && s.lon) ? [s.lat, s.lon]
       : (stationsMeta && stationsMeta[s.code]) ? [stationsMeta[s.code].lat, stationsMeta[s.code].lon] : null;
     if (!q) return;
-    const isNext = i === idx + 1, past = i <= idx;
+    const isNext = i === (loc.at >= 0 ? loc.at : loc.done + 1), past = i <= loc.done;
     const isEnd = i === 0 || i === stops.length - 1;
     const m = L.circleMarker(q, {
       radius: isNext ? 7 : isEnd ? 6 : past ? 3 : 4.5,
@@ -228,7 +252,7 @@ function drawMap(t, stops, idx) {
       fillColor: isNext || isEnd ? (isNext ? "#43d17c" : "#0b0f14") : "#0b0f14",
       fillOpacity: past && !isEnd ? 0.3 : 0.9,
     });
-    if (isNext) m.bindTooltip(`next: ${s.name}`, { permanent: true, direction: "top", className: "nextTip" });
+    if (isNext) m.bindTooltip(`${loc.at === i ? "at" : "next"}: ${s.name}`, { permanent: true, direction: "top", className: "nextTip" });
     else if (isEnd) m.bindTooltip(`${i === 0 ? "start" : "dest"}: ${s.name}`, { permanent: true, direction: "top", className: "endTip" });
     else m.bindTooltip(`${s.name}${s.bus ? " (bus)" : ""} — arr ${fmtT(s.effArr)}`, { direction: "top" });
     stopsL.addLayer(m);
@@ -243,11 +267,11 @@ function tickClock() {
   $("#clock").textContent = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
   if (!cur?.train) return;
   const stops = (cur.train.stations || []).map(norm);
-  const idx = activeIdx(stops);
-  const next = stops[idx + 1];
-  if (!next || !next.effArr) { $("#nextIn").textContent = ""; return; }
-  const sec = Math.max(0, Math.round((new Date(next.effArr) - Date.now()) / 1000));
-  $("#nextIn").textContent = sec < 45 ? "arriving" : `in ${fmtIn(Math.floor(sec / 60))}`;
+  const ev = nextEvent(stops, locate(stops));
+  if (!ev) { $("#nextIn").textContent = ""; return; }
+  const sec = Math.max(0, Math.round((ev.t - Date.now()) / 1000));
+  $("#nextIn").textContent = sec < 45 ? (ev.dep ? "boarding" : "arriving")
+    : `${ev.dep ? "dep" : "arr"} in ${fmtIn(Math.floor(sec / 60))}`;
 }
 
 /* ---------------- live data: SSE push, poll fallback ---------------- */
@@ -335,12 +359,13 @@ function tick() {
   if (!cur?.train) return;
 
   const stops = (cur.train.stations || []).map(norm);
-  const idx = activeIdx(stops);
-  const next = stops[idx + 1];
-  if (!next || !next.effArr) { $("#nextIn").textContent = ""; }
+  const loc = locate(stops);
+  const ev = nextEvent(stops, loc);
+  if (!ev) { $("#nextIn").textContent = ""; }
   else {
-    const sec = Math.max(0, Math.round((new Date(next.effArr) - Date.now()) / 1000));
-    $("#nextIn").textContent = sec < 45 ? "arriving" : `in ${fmtIn(Math.floor(sec / 60))}`;
+    const sec = Math.max(0, Math.round((ev.t - Date.now()) / 1000));
+    $("#nextIn").textContent = sec < 45 ? (ev.dep ? "boarding" : "arriving")
+      : `${ev.dep ? "dep" : "arr"} in ${fmtIn(Math.floor(sec / 60))}`;
   }
 
   // never fall behind: stale? poll now. stream dead? reopen it.
@@ -354,13 +379,22 @@ function tick() {
   // keep the dot moving between sparse GPS fixes (~10 min apart upstream):
   // prefer sliding along the learned path, else dead-reckon on the damped heading
   if (cur && (!traceAt || Date.now() - traceAt > 120000)) loadTrace(cur.numKey);
-  if (marker && gps && cur?.train) {
-    const v = +cur.train.velocity || 0;
-    const ageS = (Date.now() - gps.at) / 1000;
-    if (v > 1 && ageS > 0 && ageS < 600) {
+  if (marker && cur?.train) {
+    const atS = loc.at >= 0 ? stops[loc.at] : null;
+    const atQ = atS && stationsMeta && stationsMeta[atS.code]
+      ? [stationsMeta[atS.code].lat, stationsMeta[atS.code].lon] : null;
+    if (atQ) { // dwelling: sit on the station, no fake movement
+      const kmX = 111.32 * Math.cos(atQ[0] * D2R);
+      const dKm = Math.hypot((marker.getLatLng().lng - atQ[1]) * kmX, (marker.getLatLng().lat - atQ[0]) * 110.57);
+      if (!marker._atSnap && dKm < 50) { marker.setLatLng(atQ); halo.setLatLng(atQ); marker._atSnap = true; }
+    } else marker._atSnap = false;
+    if (gps) {
+      const v = +cur.train.velocity || 0;
+      const ageS = (Date.now() - gps.at) / 1000;
+      if (v > 1 && ageS > 0 && ageS < 600) {
       let p = null;
-      const prevS = idx >= 0 ? stops[idx] : null;
-      const nxt = idx >= 0 ? stops[idx + 1] : null;
+      const prevS = loc.done >= 0 ? stops[loc.done] : null;
+      const nxt = loc.done >= 0 ? stops[loc.done + 1] : null;
       const tr = prevS && nxt ? traceData[prevS.code + "|" + nxt.code] : null;
       if (tr && tr.length > 1) {
         const kmY = 110.57, kmX = 111.32 * Math.cos(gps.lat * D2R);
@@ -396,6 +430,7 @@ function tick() {
       if (p) { marker.setLatLng(p); halo.setLatLng(p); }
     }
   }
+}
 }
 
 // instant catch-up when the tab comes back or network returns
