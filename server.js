@@ -29,6 +29,31 @@ const cache = new Map();
 const subs = new Set();
 let lastHash = null;
 
+/** breadcrumb trail per leg "A|B" — real track geometry, learned from live GPS fixes */
+const legPts = new Map();
+function recordLegs(all) {
+  for (const inst of Object.values(all)) {
+    for (const t of inst) {
+      if (!t.lat || !t.lon || !Array.isArray(t.stations)) continue;
+      const st = t.stations;
+      let i = -1;
+      st.forEach((s, k) => { if (/^departed$/i.test(s.status || "")) i = k; });
+      if (i < 0) st.forEach((s, k) => { if (/^arrived$/i.test(s.status || "")) i = k; });
+      const a = st[i] && st[i].code, b = st[i + 1] && st[i + 1].code;
+      if (!a || !b) continue;
+      const key = a + "|" + b;
+      let arr = legPts.get(key);
+      if (!arr) { arr = []; legPts.set(key, arr); }
+      const la = +t.lat, lo = +t.lon;
+      const last = arr[arr.length - 1];
+      if (!last || Math.abs(last.la - la) + Math.abs(last.lo - lo) > 0.0005) {
+        arr.push({ la, lo });
+        if (arr.length > 4000) arr.splice(0, arr.length - 4000);
+      }
+    }
+  }
+}
+
 function fetchJSON(url) {
   return new Promise((resolve, reject) => {
     const req = https.get(
@@ -94,6 +119,7 @@ async function refreshUpstream() {
   }
   const now = Date.now();
     cache.set("trains", { at: now, goodAt: now, body });
+  recordLegs(body);
   if (subs.size === 0) return;
   const hash = crypto.createHash("sha1").update(JSON.stringify(body)).digest("hex");
   if (hash === lastHash) return;
@@ -174,6 +200,31 @@ const server = http.createServer(async (req, res) => {
         }
       }
       sendJSON(req, res, list, 10);
+      return;
+    }
+
+    // learned track geometry: GPS breadcrumbs accumulated per leg
+    const mTrace = p.match(/^\/api\/trace\/(\d+)$/);
+    if (mTrace) {
+      const slim = slimTrain(await cachedJSON("trains"), mTrace[1]);
+      const legs = {};
+      if (slim) for (const inst of Object.values(slim)) for (const t of inst) {
+        const st = t.stations || [];
+        for (let i = 0; i < st.length - 1; i++) {
+          const a = st[i].code, b = st[i + 1].code;
+          const k = a + "|" + b;
+          if (!a || !b || legs[k]) continue;
+          const arr = legPts.get(k);
+          if (!arr || arr.length < 2) continue;
+          const out = [];
+          for (const q of arr) {
+            const l = out[out.length - 1];
+            if (!l || Math.abs(l[0] - q.la) + Math.abs(l[1] - q.lo) > 0.001) out.push([+q.la.toFixed(4), +q.lo.toFixed(4)]);
+          }
+          if (out.length > 1) legs[k] = out;
+        }
+      }
+      sendJSON(req, res, { legs: legs }, 30);
       return;
     }
 

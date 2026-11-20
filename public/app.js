@@ -13,7 +13,8 @@ let tickT = null;
 let es = null;           // EventSource
 let lastPush = 0;        // ts of last data (push or poll)
 let lastMode = "";       // push | poll
-let map = null, marker = null, halo = null, track = null, stopsL = null;
+let map = null, marker = null, halo = null, trackPast = null, trackFut = null, stopsL = null;
+let traceData = {}, traceAt = 0, traceNum = null, traceBusy = false; // learned leg geometry
 let gps = null;         // last GPS fix {lat, lon, at, hdg} for dead reckoning
 
 /* great-circle helpers: keep the dot gliding between GPS fixes */
@@ -32,12 +33,14 @@ function dest(la, lo, brng, km) {
     Math.cos(d) - Math.sin(la1) * Math.sin(la2));
   return [la2 * R2D, ((lo2 * R2D) + 540) % 360 - 180];
 }
+function angleLerp(a, b, k) { const d = ((b - a + 540) % 360) - 180; return (((a + d * k) % 360) + 360) % 360; }
 function updateGps(t) {
   if (!t.lat || !t.lon) return;
-  const lat = +t.lat, lon = +t.lon;
-  if (gps && gps.lat === lat && gps.lon === lon) { gps.at = Date.now(); return; }
-  const hdg = gps ? bearing(gps.lat, gps.lon, lat, lon) : null;
-  gps = { lat, lon, at: Date.now(), hdg: hdg ?? gps?.hdg ?? null };
+  const lat = +t.lat, lon = +t.lon, now = Date.now();
+  if (!gps) { gps = { lat, lon, at: now, hdg: null }; return; }
+  if (gps.lat === lat && gps.lon === lon) { gps.at = now; return; }
+  const raw = bearing(gps.lat, gps.lon, lat, lon);
+  gps = { lat, lon, at: now, hdg: gps.hdg != null ? angleLerp(gps.hdg, raw, 0.5) : raw };
 }
 
 /* ---------------- data ---------------- */
@@ -191,12 +194,23 @@ function drawMap(t, stops, idx) {
   } else {
     marker.setLatLng(ll); halo.setLatLng(ll);
   }
-  const pts = stops.map(s => (s.lat && s.lon) || (stationsMeta && stationsMeta[s.code])
-    ? (s.lat ? [s.lat, s.lon] : [stationsMeta[s.code].lat, stationsMeta[s.code].lon]) : null).filter(Boolean);
-  if (pts.length > 1) {
-    if (track) { track.setStyle({ weight: 4, opacity: 0.8 }); track.setLatLngs(pts); }
-    else track = L.polyline(pts, { color: "#6cbcff", weight: 4, opacity: 0.8 }).addTo(map);
+  const ptOf = s => (s.lat && s.lon) ? [+s.lat, +s.lon]
+    : (stationsMeta && stationsMeta[s.code]) ? [stationsMeta[s.code].lat, stationsMeta[s.code].lon] : null;
+  const past = [], fut = [];
+  for (let i = 0; i < stops.length - 1; i++) {
+    const A = ptOf(stops[i]), B = ptOf(stops[i + 1]);
+    if (!A || !B) continue;
+    const tr = i <= idx ? traceData[stops[i].code + "|" + stops[i + 1].code] : null;
+    (i <= idx ? past : fut).push(...(tr && tr.length > 1 ? tr : [A, B]));
   }
+  if (past.length > 1) {
+    if (trackPast) trackPast.setLatLngs(past);
+    else trackPast = L.polyline(past, { color: "#6cbcff", weight: 4, opacity: 0.9 }).addTo(map);
+  } else if (trackPast) { map.removeLayer(trackPast); trackPast = null; }
+  if (fut.length > 1) {
+    if (trackFut) trackFut.setLatLngs(fut);
+    else trackFut = L.polyline(fut, { color: "#6cbcff", weight: 3, opacity: 0.4, dashArray: "4 7" }).addTo(map);
+  } else if (trackFut) { map.removeLayer(trackFut); trackFut = null; }
 
   // stops on the route: dim = done, big green + label = next, blue = ahead
   if (stopsL) { map.removeLayer(stopsL); stopsL = null; }
@@ -219,7 +233,8 @@ function drawMap(t, stops, idx) {
     else m.bindTooltip(`${s.name}${s.bus ? " (bus)" : ""} — arr ${fmtT(s.effArr)}`, { direction: "top" });
     stopsL.addLayer(m);
   });
-  map.panTo(ll, { animate: true, duration: 0.6 });
+  // follow only when the train leaves the view; let the user pan freely
+  if (!map.getBounds().pad(-0.25).contains(ll)) map.panTo(ll, { animate: true, duration: 0.6 });
 }
 
 /* per-second: clock + countdown to next arrival (no network) */
@@ -265,6 +280,22 @@ function listen(num) {
   }
 }
 function closeStream() { if (es) { es.close(); es = null; } }
+
+/* learned track geometry: the server records every GPS fix per leg */
+function loadTrace(num) {
+  if (traceBusy || (traceNum === num && traceAt && Date.now() - traceAt < 120000)) return;
+  if (traceNum !== num) traceData = {};
+  traceBusy = true; traceNum = num; traceAt = Date.now();
+  getJSON(`/api/trace/${num}`).then(d => {
+    traceBusy = false;
+    const legs = d && d.legs;
+    if (!legs) return;
+    let n = 0; for (const k in legs) n += legs[k].length;
+    if (!n) return;
+    traceData = legs;
+    if (cur && cur.numKey === num) render();
+  }).catch(() => { traceBusy = false; });
+}
 
 function refresh() {
   if (!cur) return Promise.resolve();
@@ -312,10 +343,11 @@ function tick() {
     conn();
   }
   // dead-reckon: glide the dot along the last heading at reported speed
+  if (cur && (!traceAt || Date.now() - traceAt > 120000)) loadTrace(cur.numKey);
   if (marker && gps && cur?.train) {
     const v = +cur.train.velocity || 0;
     const ageS = (Date.now() - gps.at) / 1000;
-    if (v > 1 && gps.hdg != null && ageS > 0 && ageS < 90) {
+    if (v > 1 && gps.hdg != null && ageS > 0 && ageS < 25) {
       const p = dest(gps.lat, gps.lon, gps.hdg, (v * 1.60934 * ageS) / 3600);
       marker.setLatLng(p); halo.setLatLng(p);
     }
@@ -360,6 +392,7 @@ function trackTrain(num, preferID) {
     render();
     listen(key);        // live push from here on
     startLoops();       // 1 s tick: countdown + watchdog
+    loadTrace(key);     // real track geometry for legs already run
   }).catch(e => { $("#pickHint").textContent = `#${num}: ${e.message}`; });
 }
 
