@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Amtrak Live — ride tracker</title>
+<meta name="description" content="Track your Amtrak train live: position, arrivals, and the best smoking stops.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🚆</text></svg>">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1><span class="logo">🚆</span> Amtrak Live</h1>
+  <div id="conn" class="conn" title="data freshness">connecting…</div>
+</header>
+
+<!-- Step 1: pick your train -->
+<section id="picker" class="card">
+  <h2>Which train are you on?</h2>
+  <div class="picker-grid">
+    <label>Train number
+      <input id="trainNum" inputmode="numeric" placeholder="e.g. 449" autocomplete="off">
+    </label>
+    <button id="pickBtn" class="primary">Track it</button>
+  </div>
+  <div id="pickHint" class="hint">Not sure? Browse every running train:</div>
+  <div id="trainList" class="trainlist" hidden></div>
+  <div id="recent"></div>
+  <button id="browseBtn" class="linklike">show / hide train list</button>
+</section>
+
+<!-- Step 2: the ride -->
+<main id="ride" hidden>
+  <div class="ride-head">
+    <button id="backBtn" class="linklike">← change train</button>
+    <h2 id="rideTitle"></h2>
+    <div id="rideMeta" class="meta"></div>
+  </div>
+
+  <div class="cols">
+    <section class="card mapcard">
+      <div class="mapwrap"><div id="map"></div></div>
+      <div class="maprow">
+        <a id="gmaps" target="_blank" rel="noopener">Google Maps ↗</a>
+        <span id="coords" class="mono dim"></span>
+        <button id="copyLink">copy link</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h3>Next stop</h3>
+      <div id="nextStop" class="nextstop"></div>
+      <h3>Smoking stops nearby</h3>
+      <div id="smokeNext" class="smokenext"></div>
+      <div class="legend">
+        <span class="pill">🚬 long stop — worth stepping off</span>
+      </div>
+    </section>
+  </div>
+
+  <section class="card">
+    <h3>All stops <span id="updAt" class="dim small"></span></h3>
+    <div class="tblhead row"><span>#</span><span>Station</span><span>Sched</span><span>Actual</span><span>Δ</span><span>Dwell</span><span>Status</span></div>
+    <div id="stops"></div>
+  </section>
+</main>
+
+<footer class="dim small">data: amtraker (amtrak feed) · refreshes every 20s while open · made for riders, on the ride.</footer>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
