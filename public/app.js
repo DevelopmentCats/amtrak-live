@@ -342,14 +342,48 @@ function tick() {
   } else if (lastPush && age > 20000) {
     conn();
   }
-  // dead-reckon: glide the dot along the last heading at reported speed
+  // keep the dot moving between sparse GPS fixes (~10 min apart upstream):
+  // prefer sliding along the learned path, else dead-reckon on the damped heading
   if (cur && (!traceAt || Date.now() - traceAt > 120000)) loadTrace(cur.numKey);
   if (marker && gps && cur?.train) {
     const v = +cur.train.velocity || 0;
     const ageS = (Date.now() - gps.at) / 1000;
-    if (v > 1 && gps.hdg != null && ageS > 0 && ageS < 25) {
-      const p = dest(gps.lat, gps.lon, gps.hdg, (v * 1.60934 * ageS) / 3600);
-      marker.setLatLng(p); halo.setLatLng(p);
+    if (v > 1 && ageS > 0 && ageS < 600) {
+      let p = null;
+      const nxt = stops[idx + 1];
+      const tr = nxt ? traceData[stops[idx].code + "|" + nxt.code] : null;
+      if (tr && tr.length > 1) {
+        const kmY = 110.57, kmX = 111.32 * Math.cos(gps.lat * D2R);
+        const P = tr.map(q => [q[1] * kmX, q[0] * kmY]);
+        const px = gps.lon * kmX, py = gps.lat * kmY;
+        let best = null, total = 0;
+        for (let i = 1; i < P.length; i++) {
+          const dx = P[i][0] - P[i - 1][0], dy = P[i][1] - P[i - 1][1];
+          const L = Math.hypot(dx, dy);
+          let t = L ? ((px - P[i - 1][0]) * dx + (py - P[i - 1][1]) * dy) / (L * L) : 0;
+          t = Math.max(0, Math.min(1, t));
+          const d2 = (px - (P[i - 1][0] + t * dx)) ** 2 + (py - (P[i - 1][1] + t * dy)) ** 2;
+          if (!best || d2 < best.d2) best = { d2, s: total + L * t };
+          total += L;
+        }
+        if (best && best.d2 < 25) { // fix is on/near the learned path (< ~5 km)
+          const km = (1.60934 * v * ageS) / 3600;
+          let rem = Math.min(best.s + km, total);
+          for (let i = 1; i < P.length && !p; i++) {
+            const L = Math.hypot(P[i][0] - P[i - 1][0], P[i][1] - P[i - 1][1]);
+            if (rem <= L) {
+              const t = L ? rem / L : 0;
+              p = [(P[i - 1][1] + t * (P[i][1] - P[i - 1][1])) / kmY,
+                   (P[i - 1][0] + t * (P[i][0] - P[i - 1][0])) / kmX];
+            }
+            rem -= L;
+          }
+          if (!p) p = [P[P.length - 1][1] / kmY, P[P.length - 1][0] / kmX];
+        }
+      }
+      if (!p && gps.hdg != null && ageS < 60)
+        p = dest(gps.lat, gps.lon, gps.hdg, (v * 1.60934 * ageS) / 3600);
+      if (p) { marker.setLatLng(p); halo.setLatLng(p); }
     }
   }
 }
