@@ -1,298 +1,306 @@
-/* Amtrak Live — client. No framework, no build step. */
+/* Amtrak Live — HUD client. No framework, no build. */
 "use strict";
 
 const $ = (s) => document.querySelector(s);
-const SMOKE_MIN = 20; // minutes dwell to count as a smoke break
-const POLL_MS = 20000;
+const SMOKE_MIN = 20;
+const POLL_MS = 10000;   // data refresh
+const TICK_MS = 1000;    // local clock/countdown
 
-let trains = null;           // latest /api/trains payload
-let stationsMeta = null;     // /api/stations (codes -> meta), cached in LS
-let current = null;          // active train object
-let pollTimer = null;
-let map = null, marker = null, trackLine = null;
+let trainsList = null;   // full list for the picker (lazy)
+let stationsMeta = null;
+let cur = null;          // { numKey, train }  active train
+let pollT = null, tickT = null;
+let map = null, marker = null, halo = null, track = null;
 
-// ---------- data ----------
+/* ---------------- data ---------------- */
 async function getJSON(url) {
   const r = await fetch(url);
-  if (!r.ok) throw new Error(`${url}: HTTP ${r.status}`);
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return r.json();
 }
 
-async function loadTrains() {
-  trains = await getJSON("/api/trains");
-  renderConn(true);
-}
 async function loadStations() {
   try {
-    const cached = JSON.parse(localStorage.getItem("stn_meta") || "null");
-    if (cached && Date.now() - cached.at < 864e5) { stationsMeta = cached.v; return; }
+    const c = JSON.parse(localStorage.getItem("stn") || "null");
+    if (c && Date.now() - c.at < 7 * 864e5) { stationsMeta = c.v; return; }
   } catch {}
   stationsMeta = await getJSON("/api/stations");
-  localStorage.setItem("stn_meta", JSON.stringify({ at: Date.now(), v: stationsMeta }));
+  localStorage.setItem("stn", JSON.stringify({ at: Date.now(), v: stationsMeta }));
 }
 
-// ---------- helpers ----------
+async function loadPickerList() {
+  if (trainsList) return trainsList;
+  trainsList = await getJSON("/api/trains");
+  return trainsList;
+}
+
+/* ---------------- helpers ---------------- */
 const fmtT = iso => !iso ? "–" : new Date(iso).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 const mins = ms => Math.round(ms / 60000);
-function deltaCls(m){ return m > 4 ? "delta-late" : m < -4 ? "delta-early" : "delta-ok"; }
-function deltaTxt(m){ return m == null ? "–" : (m > 0 ? `+${m}` : `${m}`) + "m"; }
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-/** normalize a station row: actuals fall back to schedule */
 function norm(s) {
   const aA = s.arr || s.schArr, aD = s.dep || s.schDep;
-  let dwell = null;
-  if (aA && aD) dwell = Math.max(0, mins(new Date(aD) - new Date(aA)));
-  let late = null;
-  if (s.arr && s.schArr) late = mins(new Date(s.arr) - new Date(s.schArr));
-  return { ...s, effArr: aA, effDep: aD, dwell, late };
+  return {
+    ...s, effArr: aA, effDep: aD,
+    dwell: aA && aD ? Math.max(0, mins(new Date(aD) - new Date(aA))) : null,
+    late: s.arr && s.schArr ? mins(new Date(s.arr) - new Date(s.schArr)) : null,
+  };
 }
-
-/** index of the stop the train is at / just left; -1 before start */
-function activeIndex(stops) {
-  let idx = -1;
-  stops.forEach((s, i) => { if (/^departed$/i.test(s.status || "")) idx = i; });
-  if (idx < 0) stops.forEach((s, i) => { if (/^arrived$/i.test(s.status || "")) idx = i; });
-  return idx;
+function activeIdx(stops) {
+  let i = -1;
+  stops.forEach((s, k) => { if (/^departed$/i.test(s.status || "")) i = k; });
+  if (i < 0) stops.forEach((s, k) => { if (/^arrived$/i.test(s.status || "")) i = k; });
+  return i;
 }
-
-function findTrain(key) {
-  if (!trains) return null;
-  // key = trainID ("1-18") or bare number ("449")
-  if (trains[key]) {
-    const list = trains[key];
-    if (list.length === 1) return list[0];
-    const now = Date.now();
-    const live = list.find(t => {
-      const st = t.stations || [];
-      const f = st[0], l = st[st.length - 1];
-      return f && l && new Date(norm(f).effDep) - 36e5 < now && now < new Date(norm(l).effArr) + 36e5;
-    });
-    return live || list[0];
-  }
-  return null;
-}
-
-function resolveKey(raw) {
-  raw = (raw || "").trim().replace(/\D/g, "");
-  if (!raw) return null;
-  if (trains[raw]) return raw;
-  const hit = Object.keys(trains).find(k => k.split("-")[0] === raw);
-  return hit || null;
-}
-
-// ---------- picker ----------
-function renderPicker() {
-  const listEl = $("#trainList");
-  if (!trains) return;
-  const rows = [];
-  for (const inst of Object.values(trains)) {
-    for (const t of inst) {
-      const st = t.stations || [];
-      const idx = activeIndex(st.map(norm));
-      const next = st[idx + 1] ? norm(st[idx + 1]) : null;
-      const late = next ? next.late : null;
-      const cls = late == null ? "b-ok" : late > 15 ? "b-late" : "b-ok";
-      const lbl = late == null ? "" : late > 15 ? `${late}m late` : "on time";
-      rows.push(`<div class="trow" data-id="${esc(t.trainID)}">
-        <span class="tnum">${esc(t.trainNum)}</span>
-        <span class="troute">${esc(t.routeName || "")}<br><span class="dim small">to ${esc(t.destName || "")}</span></span>
-        <span class="badge ${cls}">${lbl}</span>
-      </div>`);
-    }
-  }
-  rows.sort((a, b) => (a.match(/data-id="([^"]+)/)?.[1] || "").localeCompare(b.match(/data-id="([^"]+)/)?.[1] || "", undefined, { numeric: true }));
-  listEl.innerHTML = rows.join("") || "<div class='dim'>no trains right now?</div>";
-  listEl.querySelectorAll(".trow").forEach(el =>
-    el.addEventListener("click", () => pick(el.dataset.id)));
-}
-
-function renderRecent() {
-  const rec = JSON.parse(localStorage.getItem("recent") || "[]");
-  const box = $("#recent");
-  if (!rec.length) { box.innerHTML = ""; return; }
-  box.innerHTML = `<div class="hint">recent:</div>` +
-    rec.map(r => `<button class="linklike" data-id="${esc(r.id)}">${esc(r.label)}</button>`).join(" ");
-  box.querySelectorAll("button").forEach(b => b.addEventListener("click", () => pick(b.dataset.id)));
-}
-
-// ---------- ride view ----------
-function pick(id) {
-  const t = findTrain(id);
-  if (!t) { alert("Train not found — it may have completed its run. Try the list."); return; }
-  current = t;
-  location.hash = "t=" + encodeURIComponent(t.trainID);
-  localStorage.setItem("recent", JSON.stringify(
-    [{ id: t.trainID, label: `#${t.trainNum} ${t.routeName || ""}` },
-     ...JSON.parse(localStorage.getItem("recent") || "[]").filter(r => r.id !== t.trainID)].slice(0, 4)));
-  $("#picker").hidden = true;
-  $("#ride").hidden = false;
-  renderRide(true);
-  startPolling();
-}
-
-function back() {
-  stopPolling();
-  $("#ride").hidden = true;
-  $("#picker").hidden = false;
-  current = null;
-  history.replaceState(null, "", location.pathname);
-}
-
-function renderRide(full) {
-  if (!current || !trains) return;
-  const t = findTrain(current.trainID) || current;
-  current = t;
-  const stops = (t.stations || []).map(norm);
-  const idx = activeIndex(stops);
-
-  $("#rideTitle").textContent = `#${t.trainNum} — ${t.routeName || ""}`;
-  $("#rideMeta").innerHTML =
-    `${esc(t.origName || "")} → ${esc(t.destName || "")} · ` +
-    `<span id="lateness"></span>`;
-  const next = stops[idx + 1];
-  const lat = next && next.late != null ? next.late : null;
-  $("#lateness").innerHTML = lat == null ? `<span class="dim">status unknown</span>`
-    : lat > 4 ? `<span class="delta-late">≈${lat} min late</span>`
-    : lat < -4 ? `<span class="delta-early">${-lat} min early</span>`
-    : `<span class="delta-ok">on time</span>`;
-  if (t.statusMsg) $("#lateness").innerHTML += ` <span class="dim small">· ${esc(t.statusMsg)}</span>`;
-
-  // next stop card
-  if (next) {
-    $("#nextStop").innerHTML =
-      `<div class="st">${esc(next.name)} <span class="dim small">(${esc(next.code)})</span></div>
-       <div>arr <b>${fmtT(next.effArr)}</b> · dep <b>${fmtT(next.effDep)}</b>
-       ${next.late != null ? `<span class="${deltaCls(next.late)}">(${deltaTxt(next.late)})</span>` : ""}</div>
-       ${next.dwell != null ? `<div class="dim small">scheduled dwell ${next.dwell} min</div>` : ""}`;
-  } else {
-    $("#nextStop").innerHTML = `<div class="dim">${idx < 0 ? "Not started yet." : "Run complete."}</div>`;
-  }
-
-  // smoking stops
-  const upcoming = stops.slice(idx + 1).filter(s => s.dwell != null && !s.bus);
-  const smoke = upcoming.filter(s => s.dwell >= SMOKE_MIN).slice(0, 3);
-  $("#smokeNext").innerHTML = smoke.length
-    ? `<div class="stoplist">` + smoke.map(s => {
-        const until = s.effArr ? mins(new Date(s.effArr) - Date.now()) : null;
-        const when = until == null || until <= 0 ? "now" : `in ${fmtIn(until)}`;
-        return `<div class="stopitem"><span><span class="who">${esc(s.name)}</span> <span class="dim small">${when}</span></span>
-          <span class="gap">${s.dwell} min</span></div>`;
-      }).join("") + `</div>`
-    : `<div class="dim">No ${SMOKE_MIN}+ min stops coming up — stay seated ${idx < 0 ? "" : "for now"}.</div>`;
-
-  // stops table
-  $("#stops").innerHTML = stops.map((s, i) => {
-    const past = i <= idx, isNext = i === idx + 1;
-    return `<div class="row stop ${past ? "past" : ""} ${isNext ? "next" : ""}">
-      <span class="dim">${i + 1}</span>
-      <span class="stname">${esc(s.name)}${s.bus ? " 🚌" : ""}</span>
-      <span class="mono dim">${fmtT(s.schArr)}${s.schDep !== s.schArr ? "→" + fmtT(s.schDep) : ""}</span>
-      <span class="mono">${fmtT(s.effArr)}${s.effDep && s.effDep !== s.effArr ? "→" + fmtT(s.effDep) : ""}</span>
-      <span class="${deltaCls(s.late)}">${deltaTxt(s.late)}</span>
-      <span class="gap hide-sm">${s.dwell != null ? s.dwell + "m" : "–"}</span>
-      <span class="dim small hide-sm">${esc(s.status || (isNext ? "en route" : ""))}</span>
-    </div>`;
-  }).join("");
-  $("#updAt").textContent = `· updated ${new Date(t.updatedAt || Date.now()).toLocaleTimeString()}`;
-
-  // map
-  renderMap(t, stops, idx);
-}
-
 function fmtIn(m) {
-  if (m >= 1440) return Math.floor(m / 1440) + "d " + Math.round((m % 1440) / 60) + "h";
-  if (m >= 90) return Math.floor(m / 60) + "h " + (m % 60) + "m";
-  return m + "m";
+  if (m < 0) return "now";
+  if (m < 1) return "arriving";
+  if (m >= 1440) return `${Math.floor(m / 1440)}d ${Math.round((m % 1440) / 60)}h`;
+  if (m >= 60) return `${Math.floor(m / 60)}h ${m % 60}m`;
+  return `${m} min`;
 }
 
-// ---------- map ----------
-function initMap(center) {
-  if (typeof L === "undefined") return false;
-  map = L.map("map", { zoomControl: true, attributionControl: true });
-  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-    maxZoom: 18, attribution: "© OpenStreetMap",
-  }).addTo(map);
-  map.setView(center, 7);
-  return true;
+/* pick the live instance among same-number trains */
+function pickInstance(list) {
+  if (!list?.length) return null;
+  if (list.length === 1) return list[0];
+  const now = Date.now();
+  return list.find(t => {
+    const st = t.stations || [];
+    const f = st[0] && norm(st[0]), l = st[st.length - 1] && norm(st[st.length - 1]);
+    return f && l && new Date(f.effDep) - 36e5 < now && now < new Date(l.effArr) + 36e5;
+  }) || list[0];
 }
 
-function renderMap(t, stops, idx) {
-  if (!t.lat || !t.lon) { $("#coords").textContent = ""; return; }
-  $("#coords").textContent = `${t.lat.toFixed(4)}, ${t.lon.toFixed(4)} · ${t.velocity ?? "?"} mph`;
-  const g = `https://www.google.com/maps/@?api=1&map_action=map&center=${t.lat},${t.lon}&zoom=12`;
-  $("#gmaps").href = g;
+/* ---------------- HUD render ---------------- */
+function render() {
+  if (!cur?.train) return;
+  const t = cur.train;
+  const stops = (t.stations || []).map(norm);
+  const idx = activeIdx(stops);
+  const next = stops[idx + 1] || null;
+  const prev = stops[idx] || null;
 
+  $("#hudNum").textContent = `#${t.trainNum}`;
+  $("#hudRoute").textContent = t.routeName || "";
+  $("#hudOd").textContent = `${t.origName ?? ""} → ${t.destName ?? ""}`;
+
+  // status chip
+  const lat = next ? next.late : (prev ? prev.late : null);
+  const chip = $("#hudStatus");
+  if (lat == null) { chip.className = "statuschip st-unk"; chip.textContent = "status?"; }
+  else if (lat > 4) { chip.className = "statuschip st-late"; chip.textContent = `${lat} min late`; }
+  else if (lat < -4) { chip.className = "statuschip st-early"; chip.textContent = `${-lat} early`; }
+  else { chip.className = "statuschip st-ok"; chip.textContent = "on time"; }
+  if (t.statusMsg) chip.title = t.statusMsg;
+
+  // next stop
+  if (next) {
+    $("#nextName").textContent = next.name;
+    $("#nextArr").textContent = `arr ${fmtT(next.effArr)}`;
+    $("#nextSched").textContent = `sched ${fmtT(next.schArr)} · dep ${fmtT(next.effDep)}` +
+      (next.late != null ? ` · (${next.late > 0 ? "+" : ""}${next.late}m)` : "");
+  } else {
+    $("#nextName").textContent = idx < 0 ? "not started" : "run complete";
+    $("#nextArr").textContent = ""; $("#nextSched").textContent = ""; $("#nextIn").textContent = "";
+  }
+
+  // smoke stops
+  const up = stops.slice(idx + 1).filter(s => s.dwell != null && !s.bus);
+  const smoke = up.filter(s => s.dwell >= SMOKE_MIN).slice(0, 3);
+  $("#smokeList").innerHTML = smoke.length
+    ? smoke.map(s => {
+        const until = mins(new Date(s.effArr) - Date.now());
+        return `<div class="stopitem"><span><span class="who">${esc(s.name)}</span>
+          <span class="when"> ${until > 0 ? "in " + fmtIn(until) : "now"}</span></span>
+          <span class="gap">${s.dwell}′</span></div>`;
+      }).join("")
+    : `<div class="dim small">no ${SMOKE_MIN}+ min stops ahead — sit tight.</div>`;
+
+  // stats
+  $("#sSpeed").textContent = t.velocity ?? "–";
+  $("#sDelay").textContent = lat == null ? "–" : `${lat > 0 ? "+" : ""}${lat}m`;
+  $("#sPos").textContent = t.lat ? `${t.lat.toFixed(3)}, ${t.lon.toFixed(3)}` : "";
+  $("#gmaps").href = t.lat ? `https://www.google.com/maps/@?api=1&map_action=map&center=${t.lat},${t.lon}&zoom=14` : "#";
+  $("#updAt").textContent = `upd ${new Date(t.updatedAt || Date.now()).toLocaleTimeString()}`;
+
+  // side drawer rows
+  $("#sideRows").innerHTML = stops.map((s, i) => `
+    <div class="row ${i <= idx ? "past" : ""} ${i === idx + 1 ? "next" : ""}">
+      <span class="dim">${i + 1}</span>
+      <span class="stname ${s.bus ? "busT" : ""}">${esc(s.name)}</span>
+      <span class="mono">${fmtT(s.effArr)}</span>
+      <span class="${dcls(s.late)}">${dlate(s.late)}</span>
+      <span class="gapv">${s.dwell != null && s.dwell >= SMOKE_MIN ? s.dwell + "′" : ""}</span>
+    </div>`).join("");
+
+  drawMap(t, stops, idx);
+  tickClock(); // eta now
+}
+
+const dcls = m => m == null ? "dim" : m > 4 ? "delta-late" : m < -4 ? "delta-early" : "delta-ok";
+const dlate = m => m == null ? "–" : `${m > 0 ? "+" : ""}${m}m`;
+
+/* map: dark tiles, train marker + halo, route polyline, follow-cam */
+function drawMap(t, stops, idx) {
+  if (!t.lat || !t.lon) return;
   if (!map) {
-    if (!initMap([t.lat, t.lon])) {
-      // leaflet failed to load -> plain OSM iframe
-      document.querySelector(".mapwrap").innerHTML =
-        `<iframe src="https://www.openstreetmap.org/export/embed.html?bbox=${t.lon - 1},${t.lat - 0.6},${t.lon + 1},${t.lat + 0.6}&layer=mapnik&marker=${t.lat},${t.lon}"></iframe>`;
-      return;
-    }
-  } else if (document.getElementById("map").tagName !== "DIV") {
-    return; // iframe fallback already in place
+    if (typeof L === "undefined") return;
+    map = L.map("map", { zoomControl: false, attributionControl: true, dragging: true });
+    L.control.zoom({ position: "bottomright" }).addTo(map);
+    L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
+      attribution: "© OSM © CARTO", maxZoom: 18, subdomains: "abcd",
+    }).addTo(map);
   }
   const ll = [t.lat, t.lon];
   if (!marker) {
-    marker = L.circleMarker(ll, { radius: 7, color: "#3fb950", weight: 3, fillOpacity: 0.9 }).addTo(map);
-  } else { marker.setLatLng(ll); }
-
-  const pts = stops.filter(s => s.lat || stationsMeta?.[s.code]).map(s =>
-    s.lat && s.lon ? [s.lat, s.lon] : stationsMeta[s.code] ? [stationsMeta[s.code].lat, stationsMeta[s.code].lon] : null
-  ).filter(Boolean);
+    halo = L.circleMarker(ll, { radius: 16, color: "#43d17c", weight: 1, fillOpacity: 0.15, className: "pulse" }).addTo(map);
+    marker = L.circleMarker(ll, { radius: 6, color: "#0b0f14", weight: 2, fillColor: "#43d17c", fillOpacity: 1 }).addTo(map);
+    map.setView(ll, window.innerWidth < 700 ? 8 : 9, { animate: false });
+  } else {
+    marker.setLatLng(ll); halo.setLatLng(ll);
+  }
+  const pts = stops.map(s => (s.lat && s.lon) || (stationsMeta && stationsMeta[s.code])
+    ? (s.lat ? [s.lat, s.lon] : [stationsMeta[s.code].lat, stationsMeta[s.code].lon]) : null).filter(Boolean);
   if (pts.length > 1) {
-    if (trackLine) map.removeLayer(trackLine);
-    trackLine = L.polyline(pts, { color: "#58a6ff", weight: 3, opacity: 0.6 }).addTo(map);
+    if (track) track.setLatLngs(pts);
+    else track = L.polyline(pts, { color: "#6cbcff", weight: 3, opacity: 0.55 }).addTo(map);
   }
-  // follow: keep marker centered while riding
-  map.panTo(ll, { animate: true, duration: 0.5 });
+  map.panTo(ll, { animate: true, duration: 0.6 });
 }
 
-// ---------- polling / conn ----------
-function renderConn(ok, msg) {
-  const el = $("#conn");
-  if (!ok) { el.className = "conn err"; el.textContent = msg || "connection error"; return; }
-  el.className = "conn ok";
-  el.textContent = `live · refreshed ${new Date().toLocaleTimeString()}`;
+/* per-second: clock + countdown to next arrival (no network) */
+function tickClock() {
+  const d = new Date();
+  $("#clock").textContent = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  if (!cur?.train) return;
+  const stops = (cur.train.stations || []).map(norm);
+  const idx = activeIdx(stops);
+  const next = stops[idx + 1];
+  if (!next || !next.effArr) { $("#nextIn").textContent = ""; return; }
+  const sec = Math.max(0, Math.round((new Date(next.effArr) - Date.now()) / 1000));
+  $("#nextIn").textContent = sec < 45 ? "arriving" : `in ${fmtIn(Math.floor(sec / 60))}`;
 }
 
-async function tick() {
+/* ---------------- data loop ---------------- */
+async function refresh() {
   try {
-    await loadTrains();
-    if (current) renderRide(false);
-  } catch (e) {
-    renderConn(false, e.message);
-  }
+    if (cur) {
+      const d = await getJSON(`/api/train/${cur.numKey}`);
+      const key = Object.keys(d)[0];
+      const t = pickInstance(d[key]);
+      if (t) cur = { numKey: key, train: t };
+      render();
+    } else if (trainsList) {
+      renderPicker(); // keep picker fresh
+    }
+    conn(true);
+  } catch (e) { conn(false, e.message); }
 }
-function startPolling() {
-  stopPolling();
-  pollTimer = setInterval(tick, POLL_MS);
+function conn(ok, msg) {
+  const el = $("#conn");
+  el.className = "conn small " + (ok ? "ok" : "err");
+  el.textContent = ok ? `live ${new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" })}` : (msg || "error");
 }
-function stopPolling() { if (pollTimer) clearInterval(pollTimer); pollTimer = null; }
+function startLoops() {
+  stopLoops();
+  pollT = setInterval(refresh, POLL_MS);
+  tickT = setInterval(tickClock, TICK_MS);
+}
+function stopLoops() { clearInterval(pollT); clearInterval(tickT); pollT = tickT = null; }
 document.addEventListener("visibilitychange", () => {
-  if (!current) return;
-  if (document.hidden) stopPolling(); else { tick(); startPolling(); }
+  if (document.hidden) stopLoops();
+  else { refresh(); startLoops(); }
 });
 
-// ---------- misc ----------
-function esc(s) { return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+/* ---------------- picker ---------------- */
+function renderPicker() {
+  if (!trainsList) return;
+  const rows = [];
+  for (const inst of Object.values(trainsList)) {
+    for (const t of inst) {
+      const st = (t.stations || []).map(norm);
+      const i = activeIdx(st);
+      const late = st[i + 1] ? st[i + 1].late : null;
+      rows.push(`<div class="trow" data-id="${esc(t.trainID)}" data-num="${esc(t.trainNum)}">
+        <span class="tnum">#${esc(t.trainNum)}</span>
+        <span class="troute">${esc(t.routeName || "")}<br><span class="dim">to ${esc(t.destName || "")}</span></span>
+        <span class="badge ${late != null && late > 15 ? "b-late" : "b-ok"}">${late == null ? "" : late > 15 ? late + "m late" : "on time"}</span>
+      </div>`);
+    }
+  }
+  rows.sort((a, b) => (a.match(/#(\d+)/)?.[1] ?? 0) - (b.match(/#(\d+)/)?.[1] ?? 0));
+  $("#trainList").innerHTML = rows.join("") || `<div class="dim">no trains found</div>`;
+  $("#trainList").querySelectorAll(".trow").forEach(el =>
+    el.addEventListener("click", () => trackTrain(+el.dataset.num, el.dataset.id)));
+}
 
-// ---------- boot ----------
+function trackTrain(num, preferID) {
+  // fetch just this train; tiny payload
+  getJSON(`/api/train/${num}`).then(d => {
+    const key = Object.keys(d)[0];
+    if (!key) throw new Error("not running");
+    let t = preferID ? (d[key] || []).find(x => x.trainID === preferID) : null;
+    t = t || pickInstance(d[key]);
+    if (!t) throw new Error("not running");
+    cur = { numKey: key, train: t };
+    location.hash = `t=${t.trainID}`;
+    remember(t);
+    $("#picker").hidden = true;
+    render();
+    if (!pollT) startLoops(); else refresh();
+  }).catch(e => { $("#pickHint").textContent = `#${num}: ${e.message}`; });
+}
+
+function remember(t) {
+  const rec = [{ id: t.trainID, num: +t.trainNum, label: `#${t.trainNum} ${t.routeName || ""}` },
+    ...JSON.parse(localStorage.getItem("recent") || "[]").filter(r => r.num !== +t.trainNum)].slice(0, 4);
+  localStorage.setItem("recent", JSON.stringify(rec));
+  renderRecent();
+}
+function renderRecent() {
+  const rec = JSON.parse(localStorage.getItem("recent") || "[]");
+  $("#recent").innerHTML = rec.length
+    ? `<div class="hint">recent:</div>` + rec.map(r =>
+        `<button data-num="${r.num}" data-id="${esc(r.id)}" class="ghost">${esc(r.label)}</button>`).join("")
+    : "";
+  $("#recent").querySelectorAll("button").forEach(b =>
+    b.addEventListener("click", () => trackTrain(+b.dataset.num, b.dataset.id)));
+}
+
+function showPicker() {
+  stopLoops();
+  $("#picker").hidden = false;
+  loadPickerList().then(renderPicker).catch(e => { $("#pickHint").textContent = e.message; });
+}
+
+/* ---------------- boot ---------------- */
 (async function boot() {
-  $("#pickBtn").addEventListener("click", () => { const k = resolveKey($("#trainNum").value); if (k) pick(k); else alert("Enter a train number, e.g. 449"); });
+  $("#pickBtn").addEventListener("click", () => {
+    const v = $("#trainNum").value.replace(/\D/g, "");
+    if (v) trackTrain(+v); else $("#pickHint").textContent = "enter a train #";
+  });
   $("#trainNum").addEventListener("keydown", e => { if (e.key === "Enter") $("#pickBtn").click(); });
-  $("#backBtn").addEventListener("click", back);
-  $("#browseBtn").addEventListener("click", () => { const el = $("#trainList"); el.hidden = !el.hidden; });
-  $("#copyLink").addEventListener("click", () => { navigator.clipboard?.writeText(location.href); $("#copyLink").textContent = "copied ✓"; setTimeout(() => ($("#copyLink").textContent = "copy link"), 1500); });
+  $("#backBtn").addEventListener("click", showPicker);
+  $("#sideBtn").addEventListener("click", () => { $("#side").hidden = !$("#side").hidden; });
+  $("#sideClose").addEventListener("click", () => { $("#side").hidden = true; });
+  $("#copyLink").addEventListener("click", () => {
+    navigator.clipboard?.writeText(location.href);
+    $("#copyLink").textContent = "copied ✓";
+    setTimeout(() => ($("#copyLink").textContent = "share"), 1400);
+  });
+  addEventListener("keydown", e => { if (e.key === "Escape") $("#side").hidden = true; });
 
   renderRecent();
-  try {
-    await Promise.all([loadTrains(), loadStations()]);
-    renderPicker();
-    const m = location.hash.match(/t=([\w-]+)/);
-    if (m) pick(decodeURIComponent(m[1]));
-  } catch (e) {
-    renderConn(false, e.message);
-    $("#pickHint").textContent = "Could not load train data: " + e.message;
+  loadStations().catch(() => {}); // best-effort, needed only for the track line
+
+  const m = location.hash.match(/t=([\w-]+)/);
+  const num = m ? +m[1].split("-")[0] : null;
+  if (num) {
+    try { await loadStations(); } catch {}
+    trackTrain(num, m[1]); // deep link: straight into the HUD
+  } else {
+    showPicker();
   }
 })();
