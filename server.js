@@ -1,5 +1,6 @@
-// Amtrak Live — tiny proxy + static server.
-// No dependencies: node builtins only. gzip + ETag + per-train endpoint.
+// Amtrak Live — proxy + static server + SSE live push.
+// Node builtins only. Upstream is polled continuously; connected clients
+// get an instant push whenever the data actually changes.
 
 import http from "node:http";
 import https from "node:https";
@@ -17,11 +18,16 @@ const UPSTREAMS = {
   trains: "https://api.amtraker.com/v3/trains",
   stations: "https://api.amtraker.com/v3/stations",
 };
-const CACHE_TTL_MS = 15 * 1000;
+const POLL_MS = 8000;        // upstream refresher cadence
+const CACHE_TTL_MS = 8000;
 const STALE_MAX_MS = 10 * 60 * 1000;
+const HEARTBEAT_MS = 15000;
 
 /** { at, goodAt, body } */
 const cache = new Map();
+/** SSE subscribers: { res, num } */
+const subs = new Set();
+let lastHash = null;
 
 function fetchJSON(url) {
   return new Promise((resolve, reject) => {
@@ -64,6 +70,52 @@ async function cachedJSON(key) {
   }
 }
 
+/** slim a full payload down to one train number's instances */
+function slimTrain(all, num) {
+  const key = Object.keys(all).find(k => k === String(num) || k.split("-")[0] === String(num));
+  if (!key) return null;
+  return { [key]: all[key].map(t => {
+    const { alerts, dataSource, provider, providerShort, onlyOfTrainNum, trainNumRaw, iconColor, textColor, ...rest } = t;
+    rest.stations = (t.stations || []).map(s => {
+      const { stopIconColor, ...rs } = s;
+      return rs;
+    });
+    return rest;
+  }) };
+}
+
+/* ---------------- background refresher + SSE broadcast ---------------- */
+async function refreshUpstream() {
+  let body;
+  try {
+    body = await fetchJSON(UPSTREAMS.trains);
+  } catch {
+    return; // keep serving stale from cache; subscribers just don't get pushes
+  }
+  const now = Date.now();
+  cache.set("trains", { at: now, goodAt: now, body });
+  if (subs.size === 0) return;
+  const hash = crypto.createHash("sha1").update(JSON.stringify(body)).digest("hex");
+  if (hash === lastHash) return;
+  lastHash = hash;
+  for (const sub of subs) {
+    const slim = slimTrain(body, sub.num);
+    try {
+      if (!slim) sub.res.write(`event: gone\ndata: {}\n\n`);
+      else sub.res.write(`data: ${JSON.stringify(slim)}\n\n`);
+    } catch { /* closed; cleanup happens on 'close' */ }
+  }
+}
+setInterval(refreshUpstream, POLL_MS).unref?.();
+refreshUpstream();
+
+setInterval(() => {
+  for (const sub of subs) {
+    try { sub.res.write(`: hb\n\n`); } catch {}
+  }
+}, HEARTBEAT_MS).unref?.();
+
+/* ---------------- http ---------------- */
 const MIME = {
   ".html": "text/html; charset=utf-8",
   ".css": "text/css; charset=utf-8",
@@ -75,7 +127,6 @@ const MIME = {
   ".woff2": "font/woff2",
 };
 
-/** gzip + ETag + 304 support for a JSON object */
 function sendJSON(req, res, obj, sMaxAge = 10) {
   const raw = Buffer.from(JSON.stringify(obj));
   const etag = `"${crypto.createHash("sha1").update(raw).digest("hex").slice(0, 16)}"`;
@@ -87,11 +138,7 @@ function sendJSON(req, res, obj, sMaxAge = 10) {
   }
   if ((req.headers["accept-encoding"] || "").includes("gzip")) {
     zlib.gzip(raw, { level: 6 }, (err, buf) => {
-      if (err) {
-        res.writeHead(200, headers);
-        res.end(raw);
-        return;
-      }
+      if (err) { res.writeHead(200, headers); res.end(raw); return; }
       res.writeHead(200, { ...headers, "Content-Encoding": "gzip", "Content-Length": buf.length });
       res.end(buf);
     });
@@ -107,35 +154,69 @@ const server = http.createServer(async (req, res) => {
 
   try {
     if (p === "/api/trains" || p === "/api/stations") {
-      sendJSON(req, res, await cachedJSON(p.slice(5)), p === "/api/stations" ? 3600 : 10);
+      sendJSON(req, res, await cachedJSON(p.slice(5)), p === "/api/stations" ? 3600 : 5);
       return;
     }
 
-    // /api/train/<number> -> just that train's instances (~KBs instead of 1.3 MB)
-    const m = p.match(/^\/api\/train\/(\d+)$/);
-    if (m) {
+    // tiny index for the picker (~KBs): one row per running instance
+    if (p === "/api/list") {
       const all = await cachedJSON("trains");
-      const key = Object.keys(all).find(k => k === m[1] || k.split("-")[0] === m[1]);
-      if (!key) {
+      const list = [];
+      for (const inst of Object.values(all)) {
+        for (const t of inst) {
+          const st = t.stations || [];
+          let i = -1;
+          st.forEach((s, k) => { if (/^departed$/i.test(s.status || "")) i = k; });
+          if (i < 0) st.forEach((s, k) => { if (/^arrived$/i.test(s.status || "")) i = k; });
+          const nx = st[i + 1];
+          const late = nx && nx.arr && nx.schArr ? Math.round((new Date(nx.arr) - new Date(nx.schArr)) / 60000) : null;
+          list.push({ n: +t.trainNum, id: t.trainID, r: t.routeName || "", d: t.destName || "", o: t.origName || "", late });
+        }
+      }
+      sendJSON(req, res, list, 10);
+      return;
+    }
+
+    const mTrain = p.match(/^\/api\/train\/(\d+)$/);
+    if (mTrain) {
+      const slim = slimTrain(await cachedJSON("trains"), mTrain[1]);
+      if (!slim) {
         res.writeHead(404, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "train not running" }));
         return;
       }
-      // slim the payload: drop fields the HUD never reads
-      const slim = { [key]: all[key].map(t => {
-        const { alerts, dataSource, provider, providerShort, onlyOfTrainNum, trainNumRaw, iconColor, textColor, stopIconColor, ...rest } = t;
-        rest.stations = t.stations.map(s => {
-          const { stopIconColor, ...rs } = s;
-          return rs;
-        });
-        return rest;
-      }) };
-      sendJSON(req, res, slim, 10);
+      sendJSON(req, res, slim, 5);
+      return;
+    }
+
+    // SSE: /api/stream/train/<num> — initial snapshot, then a push per upstream change
+    const mStream = p.match(/^\/api\/stream\/train\/(\d+)$/);
+    if (mStream) {
+      const num = mStream[1];
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache, no-transform",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+      });
+      res.write("retry: 3000\n\n");
+      const sub = { res, num };
+      subs.add(sub);
+      req.on("close", () => subs.delete(sub));
+      try {
+        const slim = slimTrain(await cachedJSON("trains"), num);
+        if (slim) res.write(`data: ${JSON.stringify(slim)}\n\n`);
+        else res.write(`event: gone\ndata: {}\n\n`);
+      } catch { /* initial snapshot failed; pushes will follow */ }
       return;
     }
   } catch (err) {
-    res.writeHead(502, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: String(err.message || err) }));
+    if (!res.headersSent) {
+      res.writeHead(502, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: String(err.message || err) }));
+    } else {
+      try { res.end(); } catch {}
+    }
     return;
   }
 
@@ -165,4 +246,6 @@ const server = http.createServer(async (req, res) => {
   res.end("not found");
 });
 
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;
 server.listen(PORT, () => console.log(`amtrak-live listening on :${PORT}`));
