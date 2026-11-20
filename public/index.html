@@ -2,71 +2,86 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Amtrak Live — ride tracker</title>
-<meta name="description" content="Track your Amtrak train live: position, arrivals, and the best smoking stops.">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Amtrak Live — trip HUD</title>
+<meta name="description" content="Full-screen HUD for your Amtrak trip: live map, arrivals, and the best smoke stops.">
+<meta name="theme-color" content="#0b0f14">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🚆</text></svg>">
+<link rel="preconnect" href="https://unpkg.com">
+<link rel="preconnect" href="https://a.basemaps.cartocdn.com">
+<link rel="preconnect" href="https://b.basemaps.cartocdn.com">
+<link rel="preconnect" href="https://c.basemaps.cartocdn.com">
+<link rel="dns-prefetch" href="https://api.amtraker.com">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<header>
-  <h1><span class="logo">🚆</span> Amtrak Live</h1>
-  <div id="conn" class="conn" title="data freshness">connecting…</div>
+
+<!-- HUD -->
+<div id="map" aria-hidden="true"></div>
+
+<header class="bar top">
+  <div class="idblock">
+    <button id="backBtn" class="ghost" title="change train">☰</button>
+    <div>
+      <div class="idline"><b id="hudNum"></b> <span id="hudRoute"></span></div>
+      <div class="dim small" id="hudOd"></div>
+    </div>
+  </div>
+  <div class="statuschip" id="hudStatus"></div>
+  <div class="right">
+    <div class="clock big" id="clock">–:––</div>
+    <div class="conn small" id="conn">…</div>
+  </div>
 </header>
 
-<!-- Step 1: pick your train -->
-<section id="picker" class="card">
-  <h2>Which train are you on?</h2>
-  <div class="picker-grid">
-    <label>Train number
-      <input id="trainNum" inputmode="numeric" placeholder="e.g. 449" autocomplete="off">
-    </label>
-    <button id="pickBtn" class="primary">Track it</button>
+<aside id="side" hidden>
+  <div class="sidehead">All stops <button id="sideClose" class="ghost">×</button></div>
+  <div class="tblhead row"><span>#</span><span>Station</span><span>Arr</span><span>Δ</span><span>Dwell</span></div>
+  <div id="sideRows"></div>
+</aside>
+
+<section class="hudgrid">
+  <div class="nextcard glass">
+    <div class="k">next stop</div>
+    <div class="huge" id="nextName">–</div>
+    <div class="sub"><span id="nextArr"></span> · <b class="eta" id="nextIn"></b></div>
+    <div class="dim small" id="nextSched"></div>
   </div>
-  <div id="pickHint" class="hint">Not sure? Browse every running train:</div>
-  <div id="trainList" class="trainlist" hidden></div>
-  <div id="recent"></div>
-  <button id="browseBtn" class="linklike">show / hide train list</button>
+
+  <div class="smokecard glass" id="smokeCard">
+    <div class="k">🚬 stretch your legs</div>
+    <div id="smokeList"></div>
+  </div>
+
+  <div class="statcard glass">
+    <div class="stat"><span class="k">speed</span><b id="sSpeed">–</b><span class="u">mph</span></div>
+    <div class="stat"><span class="k">delay</span><b id="sDelay">–</b></div>
+    <div class="stat dim small"><span id="sPos"></span></div>
+  </div>
 </section>
 
-<!-- Step 2: the ride -->
-<main id="ride" hidden>
-  <div class="ride-head">
-    <button id="backBtn" class="linklike">← change train</button>
-    <h2 id="rideTitle"></h2>
-    <div id="rideMeta" class="meta"></div>
+<div class="bar bottom">
+  <button id="sideBtn" class="ghost">schedule</button>
+  <a id="gmaps" target="_blank" rel="noopener" class="ghost">maps ↗</a>
+  <button id="copyLink" class="ghost">share</button>
+  <span class="dim small" id="updAt"></span>
+</div>
+
+<!-- picker overlay -->
+<div id="picker" class="overlay" hidden>
+  <div class="panel glass">
+    <h2>Which train are you on?</h2>
+    <div class="picker-grid">
+      <input id="trainNum" inputmode="numeric" placeholder="# e.g. 449" autocomplete="off">
+      <button id="pickBtn" class="primary">Track</button>
+    </div>
+    <div id="pickHint" class="hint">or pick from every running train:</div>
+    <div id="trainList" class="trainlist"></div>
+    <div id="recent"></div>
+    <div class="errbox dim small" id="bootErr"></div>
   </div>
-
-  <div class="cols">
-    <section class="card mapcard">
-      <div class="mapwrap"><div id="map"></div></div>
-      <div class="maprow">
-        <a id="gmaps" target="_blank" rel="noopener">Google Maps ↗</a>
-        <span id="coords" class="mono dim"></span>
-        <button id="copyLink">copy link</button>
-      </div>
-    </section>
-
-    <section class="card">
-      <h3>Next stop</h3>
-      <div id="nextStop" class="nextstop"></div>
-      <h3>Smoking stops nearby</h3>
-      <div id="smokeNext" class="smokenext"></div>
-      <div class="legend">
-        <span class="pill">🚬 long stop — worth stepping off</span>
-      </div>
-    </section>
-  </div>
-
-  <section class="card">
-    <h3>All stops <span id="updAt" class="dim small"></span></h3>
-    <div class="tblhead row"><span>#</span><span>Station</span><span>Sched</span><span>Actual</span><span>Δ</span><span>Dwell</span><span>Status</span></div>
-    <div id="stops"></div>
-  </section>
-</main>
-
-<footer class="dim small">data: amtraker (amtrak feed) · refreshes every 20s while open · made for riders, on the ride.</footer>
+</div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="app.js"></script>
